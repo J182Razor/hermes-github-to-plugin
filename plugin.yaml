@@ -1,0 +1,18 @@
+name: github-to-hermes
+version: 1.0.0
+description: "Convert any GitHub repository into a Hermes plugin (native or portable Agent Plugin v1). Detects MCP servers, REST/OpenAPI, CLIs, Python packages, and skill collections, then generates a ready-to-validate plugin scaffold."
+author: J182Razor
+license: MIT
+homepage: https://github.com/J182Razor/hermes-github-to-plugin
+tags: [tools, converter, scaffolding, mcp]
+requires_hermes: ">=0.22.0"
+provides_tools:
+  - detect_repo
+  - convert_repo
+  - validate_plugin
+provides_hooks: []
+requires_env: []
+config_schema:
+  output_root: {type: str, default: "", description: "Default directory where generated plugins are written"}
+  github_token: {type: secret, env: GITHUB_TO_HERMES_TOKEN, description: "Optional GitHub token for private repos / higher rate limits"}
+python_dependencies: []
