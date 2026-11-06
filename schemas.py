@@ -25,10 +25,10 @@ DETECT_REPO_SCHEMA = _schema(
 
 CONVERT_REPO_SCHEMA = _schema(
     "convert_repo",
-    "Detect a GitHub repository's type and generate a complete Hermes plugin (native or portable Agent Plugin v1) into output_dir/<name>/. Runs validation on the result.",
+    "Convert supported repository types without running validation or source code. Review generated output before enabling; unsupported types fail closed.",
     {
         "repo_url": _str("GitHub repository URL."),
-        "output_dir": _str("Directory where the generated plugin is written. Defaults to the plugin's output_root config or a temp dir."),
+        "output_dir": _str("Directory where the generated plugin is written. Defaults to a temp dir."),
         "name": _str("Override the generated plugin name."),
         "type": _str("Force a detection type: mcp, rest, cli, python_pkg, skill_bundle, unknown."),
     },
@@ -37,7 +37,8 @@ CONVERT_REPO_SCHEMA = _schema(
 
 VALIDATE_PLUGIN_SCHEMA = _schema(
     "validate_plugin",
-    "Run `hermes plugins validate <path> --install-deps` and `hermes plugins doctor <path> --ci` on a plugin directory and return a combined report.",
-    {"path": _str("Path to the plugin directory.")},
+    "Static metadata checks by default. Runtime mode executes plugin code with your OS privileges, without a sandbox; standard Hermes approval policy may bypass prompts.",
+    {"path": _str("Path to the plugin directory."),
+     "mode": {"type": "string", "enum": ["static", "runtime"], "description": "Runtime invokes the normal Hermes approval gate; it may not prompt."}},
     required=["path"],
 )

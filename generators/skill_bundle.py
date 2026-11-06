@@ -1,71 +1,60 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
+import stat
 from pathlib import Path
+
+
+def _check_entry(path: Path) -> None:
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+        raise ValueError('links and reparse points in skill bundles are unsupported')
+    if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+        raise ValueError('special files in skill bundles are unsupported')
+    name = path.name.casefold()
+
+    if (name == '.git' or name.startswith('.git.') or name in {'.env', '.envrc'} or name.startswith('.env.')
+            or name in {'.ssh', '.aws', '.gnupg', '.netrc', '.npmrc', '.pypirc', '.docker',
+                        'credentials', 'credential', 'auth', 'secrets', 'secret', 'id_rsa', 'id_ed25519'}
+            or re.search(r'(^|[._-])(credentials?|auth|secrets?|tokens?|private[._-]?key|api[._-]?key)([._-]|$)', name)
+            or name.startswith(('id_rsa.', 'id_ed25519.'))
+            or name.endswith(('.pem', '.key', '.p12', '.pfx', '.keystore', '.jks'))):
+        raise ValueError('sensitive path in skill bundle is unsupported')
+
+
+def _check_tree(path: Path) -> None:
+    _check_entry(path)
+    if path.is_dir():
+        with os.scandir(path) as entries:
+            for entry in entries:
+                _check_tree(Path(entry.path))
 
 
 def generate(repo_path: str, out_dir: str, name: str, report: dict) -> dict:
     root = Path(repo_path)
+    skills = root / 'skills'
+    _check_entry(skills)
+    if not skills.is_dir():
+        raise ValueError('a real skills directory is required')
+    entries = sorted(skills.iterdir())
+    for entry in entries:
+        _check_entry(entry)
+    sources = [p for p in entries if p.is_dir() and (p / 'SKILL.md').is_file()]
+    if not sources:
+        raise ValueError('no self-contained skills/*/SKILL.md found')
+    for src in sources:
+        _check_tree(src)
     out = Path(out_dir) / name
-    out.mkdir(parents=True, exist_ok=True)
-
-    # plugin.json (portable, skills only)
-    plugin_json = {
-        "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
-        "name": name,
-        "version": "1.0.0",
-        "description": f"Skill bundle generated from {report.get('repo_url', '')}",
-        "author": {"name": "BlueStarJL"},
-        "license": "MIT",
-        "homepage": report.get("repo_url", ""),
-        "keywords": ["skills", "generated"],
-    }
-    (out / "plugin.json").write_text(json.dumps(plugin_json, indent=2), encoding="utf-8")
-
-    # copy skills
-    skills_out = out / "skills"
-    skills_out.mkdir(exist_ok=True)
-    src_skills = root / "skills"
-    if src_skills.is_dir():
-        for child in src_skills.iterdir():
-            if child.is_dir() and (child / "SKILL.md").is_file():
-                dest = skills_out / child.name
-                if dest.exists():
-                    shutil.rmtree(dest)
-                shutil.copytree(child, dest)
-                # adapt frontmatter name to namespaced
-                skill_md = dest / "SKILL.md"
-                text = skill_md.read_text(encoding="utf-8")
-                # replace name: <child.name> with name: <child.name> (keep dir name)
-                skill_md.write_text(text, encoding="utf-8")
-    else:
-        # create a skill from README
-        d = skills_out / name
-        d.mkdir(exist_ok=True)
-        (d / "SKILL.md").write_text(
-            f"---\nname: {name}\ndescription: Generated skill bundle from {report.get('repo_url', '')}.\n---\n\nSee source repo.\n",
-            encoding="utf-8",
-        )
-
-    # copy bracket.py etc? Copy all top-level .py and md? Copy supporting files into first skill dir
-    first_skill = None
-    if skills_out.exists():
-        for c in skills_out.iterdir():
-            if c.is_dir():
-                first_skill = c
-                break
-    if first_skill:
-        for f in root.iterdir():
-            if f.is_file() and f.name not in ("README.md",):
-                try:
-                    shutil.copy2(f, first_skill / f.name)
-                except Exception:
-                    pass
-
-    (out / "README.md").write_text(
-        f"# {name}\n\nSkill bundle generated from {report.get('repo_url', '')}.\n\n"
-        "Portable Agent Plugins v1 package (skills/ only).\n",
-        encoding="utf-8",
-    )
-    return {"output_path": str(out), "files": sorted(str(p.relative_to(out)) for p in out.rglob("*") if p.is_file())}
+    out.mkdir(parents=True, exist_ok=False)
+    try:
+        (out / 'plugin.json').write_text(json.dumps({'$schema': 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json', 'name': name, 'version': '1.0.0', 'description': 'Skill bundle; review required'}, indent=2), encoding='utf-8')
+        for src in sources:
+            shutil.copytree(src, out / 'skills' / src.name)
+        (out / 'README.md').write_text('Review all content for embedded secrets, instructions and scripts before sharing or enabling. Filename checks cannot prove content is secret-free.\n', encoding='utf-8')
+    except Exception:
+        # Leave partial output for manual inspection; path-based deletion can race.
+        raise
+    return {'output_path': str(out), 'files': sorted(str(p.relative_to(out)) for p in out.rglob('*') if p.is_file())}

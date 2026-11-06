@@ -1,0 +1,76 @@
+import asyncio
+import json
+import threading
+import inspect
+import re
+from importlib.metadata import version
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp import types
+import adapter
+
+manager = adapter.SessionManager()
+lock = asyncio.Lock()
+
+async def list_tools(ctx, params):
+    return types.ListToolsResult(tools=[types.Tool(name='invoke_reviewed_server', description='Invoke reviewed source with full OS privileges in a persistent session', inputSchema={'type':'object','properties':{'toolName':{'type':'string'},'arguments':{'type':'object'}},'required':['toolName','arguments'],'additionalProperties':False}, annotations=types.ToolAnnotations(readOnlyHint=False))])
+
+async def call_tool(ctx, params):
+    if params.name != 'invoke_reviewed_server':
+        return types.CallToolResult(content=[types.TextContent(type='text', text='unknown tool')], isError=True)
+    async with lock:
+        cancel = threading.Event()
+        task = asyncio.create_task(asyncio.to_thread(manager.handle, params.arguments or {}, cancel=cancel))
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancel.set()
+            # Further cancellations must not release the shared-manager lock early.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            # Retrieve any worker exception while preserving caller cancellation.
+            if not task.cancelled():
+                task.exception()
+            raise
+    return types.CallToolResult(content=[types.TextContent(type='text', text=json.dumps(result))], isError=not result.get('success', False))
+
+def sdk_major(installed):
+    if not isinstance(installed, str) or not re.fullmatch(r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)', installed, re.ASCII):
+        raise RuntimeError('unsupported MCP version')
+    major = installed.split('.')[0]
+    if major not in ('1', '2'):
+        raise RuntimeError('unsupported MCP version')
+    return major
+
+async def main():
+    major = sdk_major(version('mcp'))
+    parameters = inspect.signature(Server).parameters
+    if major == '2' and {'on_list_tools', 'on_call_tool'} <= parameters.keys():
+        server = Server('deferred-reviewed-source', on_list_tools=list_tools, on_call_tool=call_tool)
+    elif major == '1' and callable(getattr(Server, 'list_tools', None)) and callable(getattr(Server, 'call_tool', None)):
+        server = Server('deferred-reviewed-source')
+        @server.list_tools()
+        async def legacy_list():
+            return (await list_tools(None, None)).tools
+        @server.call_tool()
+        async def legacy_call(name, arguments):
+            from types import SimpleNamespace
+            result = await call_tool(None, SimpleNamespace(name=name, arguments=arguments))
+            if result.isError:
+                raise ValueError(result.content[0].text)
+            return result.content
+    else:
+        raise RuntimeError('unsupported MCP server API')
+    try:
+        async with stdio_server() as (read, write):
+            await server.run(read, write, server.create_initialization_options())
+    finally:
+        manager.close()
+
+if __name__ == '__main__':
+    asyncio.run(main())
