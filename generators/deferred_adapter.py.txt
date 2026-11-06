@@ -1,0 +1,126 @@
+import base64
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+class InvalidStartupUnicode(ValueError):
+    pass
+
+class SessionManager:
+    def __init__(self):
+        self.worker = None
+        self.startup_digest = None
+
+    def close(self):
+        if self.worker:
+            self.worker.close()
+            self.worker = None
+
+    def handle(self, args, cancel=None):
+        try:
+            return self._handle(args, cancel)
+        except InvalidStartupUnicode as exc:
+            return {'success': False, 'error': str(exc)}
+        except Exception as exc:
+            self.close()
+            return {'success': False, 'error': str(exc)}
+
+    def _handle(self, args, cancel=None):
+        if os.name != 'nt':
+            raise ValueError('Windows job containment required')
+        if set(args) != {'toolName', 'arguments'} or not isinstance(args['toolName'], str) or not isinstance(args['arguments'], dict):
+            raise ValueError('toolName and arguments required')
+        try:
+            consent = Path(sys.argv[1])
+            if consent.is_symlink():
+                raise ValueError('invalid opt-in')
+            with consent.open('rb') as f:
+                if f.read(54) != b'I TRUST THIS SOURCE WITH PERSISTENT FULL OS AUTHORITY':
+                    raise ValueError('invalid opt-in')
+        except (OSError, IndexError, ValueError):
+            raise ValueError('persistent authority operator opt-in missing or invalid')
+        startup_args = []
+        if PACKAGE_MODULE and CONSOLE_FUNCTION:
+            import stat
+            config = consent.parent / 'mcp-startup-args.json'
+            parent_info = config.parent.lstat()
+            if not stat.S_ISDIR(parent_info.st_mode) or getattr(parent_info, 'st_file_attributes', 0) & 0x400:
+                raise ValueError('invalid startup arguments directory')
+            try:
+                info = config.lstat()
+            except FileNotFoundError:
+                raw = b'[]'
+            else:
+                if not stat.S_ISREG(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400 or info.st_nlink != 1:
+                    raise ValueError('invalid startup arguments file')
+                with config.open('rb') as stream:
+                    opened = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(opened.st_mode) or getattr(opened, 'st_file_attributes', 0) & 0x400 or opened.st_nlink != 1 or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                        raise ValueError('invalid startup arguments file')
+                    raw = stream.read(16385)
+                if len(raw) > 16384:
+                    raise ValueError('startup arguments file too large')
+            try:
+                startup_args = json.loads(raw.decode('utf-8'))
+            except (ValueError, UnicodeError):
+                raise ValueError('invalid startup arguments JSON') from None
+            if not isinstance(startup_args, list) or len(startup_args) > 64 or any(not isinstance(x, str) or len(x) > 4096 or '\x00' in x for x in startup_args):
+                raise ValueError('invalid startup arguments')
+            if any(any(0xD800 <= ord(ch) <= 0xDFFF for ch in x) for x in startup_args):
+                raise InvalidStartupUnicode('invalid startup arguments Unicode')
+            startup_digest = hashlib.sha256(raw).hexdigest()
+            if self.worker is not None and startup_digest != self.startup_digest:
+                raise ValueError('startup arguments changed; worker closed, retry to restart')
+        if PACKAGE_MODULE:
+            import stat
+            root = Path(__file__).parent / 'source'
+            sources = {}
+            for relative, digest in PACKAGE_HASHES.items():
+                path = root
+                for component in relative.split('/'):
+                    info = path.lstat()
+                    if not stat.S_ISDIR(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+                        raise ValueError('source directory link forbidden')
+                    path = path / component
+                info = path.lstat()
+                if not stat.S_ISREG(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+                    raise ValueError('source link forbidden')
+                with path.open('rb') as stream:
+                    source = stream.read(1048577)
+                if len(source) > 1048576 or hashlib.sha256(source).hexdigest() != digest:
+                    raise ValueError('source digest mismatch')
+                sources[relative] = base64.b64encode(source).decode('ascii')
+            request = {'package': {'module': PACKAGE_MODULE, 'files': sources}, 'digests': PACKAGE_HASHES}
+            if CONSOLE_FUNCTION:
+                request['package']['entrypoint'] = CONSOLE_FUNCTION
+                request['package']['identity'] = CONSOLE_IDENTITY
+                request['requirements'] = CONSOLE_REQUIREMENTS
+                request['startup_args'] = startup_args
+                request['startup_digest'] = hashlib.sha256(json.dumps(startup_args, ensure_ascii=True, separators=(',', ':')).encode()).hexdigest()
+        else:
+            import stat
+            source_path = Path(__file__).with_name('source.py')
+            try:
+                info = source_path.lstat()
+                if not stat.S_ISREG(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+                    raise ValueError('invalid source file')
+                with source_path.open('rb') as stream:
+                    source = stream.read(12001)
+            except OSError:
+                raise ValueError('invalid source file') from None
+            if len(source) > 12000 or hashlib.sha256(source).hexdigest() != DIGEST:
+                raise ValueError('source digest mismatch')
+            request = {'source':base64.b64encode(source).decode('ascii'), 'digest':DIGEST}
+        request.update({'name':args['toolName'], 'arguments':args['arguments']})
+        payload = json.dumps(request).encode()
+        if cancel and cancel.is_set():
+            raise ValueError('cancelled')
+        if self.worker is None:
+            self.worker = PersistentWorker([sys.executable, '-I', str(Path(__file__).with_name('worker.py'))])
+            if PACKAGE_MODULE and CONSOLE_FUNCTION:
+                self.startup_digest = startup_digest
+        result = json.loads(self.worker.request(payload, timeout=30, cancel=cancel))
+        if not isinstance(result, dict) or not isinstance(result.get('success'), bool):
+            raise ValueError('invalid worker response')
+        return result

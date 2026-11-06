@@ -1,0 +1,158 @@
+import base64
+import hashlib
+import json
+import math
+import subprocess
+import stat
+import sys
+import threading
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).parent / 'source'
+PROGRAM = r'''import base64, contextlib, importlib.abc, importlib.util, io, json, os, sys, types
+sys.stdout.reconfigure(encoding='utf-8', errors='replace', newline='\n')
+sys.stderr.reconfigure(encoding='utf-8', errors='replace', newline='\n')
+payload=json.load(sys.stdin)
+response_fd=None
+if payload['kind'] != 'cli':
+ if os.name == 'nt':
+  import msvcrt
+  response_fd=msvcrt.open_osfhandle(int(sys.argv[1]), os.O_WRONLY | os.O_BINARY)
+ else: response_fd=int(sys.argv[1])
+files=types.MappingProxyType(payload.pop('files'))
+class Bounded(io.StringIO):
+ def __init__(self):
+  super().__init__(); self.size=0
+ def write(self, s):
+  self.size += len(s.encode('utf-8'))
+  if self.size > 262144: raise ValueError('output limit exceeded')
+  return super().write(s)
+logs=Bounded()
+class Resource:
+ def __init__(self, prefix, path=''):
+  self.prefix=prefix; self.path=path
+ @property
+ def name(self): return self.path.rsplit('/',1)[-1] if self.path else self.prefix.rstrip('/').rsplit('/',1)[-1]
+ def iterdir(self):
+  if not self.is_dir(): raise NotADirectoryError(self.name)
+  prefix=self.prefix+(self.path+'/' if self.path else '')
+  return iter(Resource(self.prefix,(self.path+'/' if self.path else '')+child) for child in sorted({key[len(prefix):].split('/')[0] for key in files if key.startswith(prefix)}))
+ def is_dir(self): return any(key.startswith(self.prefix+(self.path+'/' if self.path else '')) for key in files)
+ def is_file(self): return bool(self.path) and self.prefix+self.path in files
+ def joinpath(self, *names):
+  path=self.path
+  for name in names:
+   if not isinstance(name,str) or not name or chr(92) in name or any(part in ('','.','..') for part in name.split('/')): raise ValueError('unsupported resource path')
+   path='/'.join(filter(None,(path,name)))
+  return Resource(self.prefix,path)
+ __truediv__=joinpath
+ def open(self, mode='r', *args, **kwargs):
+  if not self.is_file(): raise FileNotFoundError(self.name)
+  raw=base64.b64decode(files[self.prefix+self.path])
+  if mode=='rb': return io.BytesIO(raw)
+  if mode=='r': return io.TextIOWrapper(io.BytesIO(raw), *args, **kwargs)
+  raise ValueError('resource is read-only')
+ def read_bytes(self):
+  with self.open('rb') as f: return f.read()
+ def read_text(self, encoding=None, errors=None):
+  with self.open('r', encoding=encoding, errors=errors) as f: return f.read()
+class Reader:
+ def __init__(self, package): self.prefix=package.replace('.', '/')+'/'
+ def files(self): return Resource(self.prefix)
+class Loader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+ def find_spec(self, fullname, path=None, target=None):
+  name=fullname.replace('.', '/')
+  key=name+'/__init__.py' if name+'/__init__.py' in files else name+'.py'
+  if key not in files: return None
+  return importlib.util.spec_from_loader(fullname, self, is_package=key.endswith('/__init__.py'))
+ def create_module(self, spec): return None
+ def get_resource_reader(self, fullname): return Reader(fullname)
+ def exec_module(self, module):
+  name=module.__name__.replace('.', '/')
+  key=name+'/__init__.py' if name+'/__init__.py' in files else name+'.py'
+  module.__file__='<reviewed>/' + key
+  exec(compile(base64.b64decode(files[key]), module.__file__, 'exec'), module.__dict__)
+sys.meta_path.insert(0, Loader())
+try:
+ with contextlib.redirect_stdout(logs if payload['kind']=='cli' else sys.stdout):
+  if len(files)==1 and payload['module']+'.py' in files:
+   spec=importlib.util.spec_from_loader('_g2h_reviewed_entry', loader=None)
+   module=importlib.util.module_from_spec(spec)
+   module.__file__='<reviewed>/' + payload['module'] + '.py'
+   exec(compile(base64.b64decode(files[payload['module']+'.py']), module.__file__, 'exec'), module.__dict__)
+  else:
+   if payload['module'].split('.')[0] in sys.modules: raise ValueError('reviewed package collides with runtime module')
+   module=__import__(payload['module'], fromlist=[payload['function']])
+  fn=getattr(module, payload['function'])
+  if payload['kind']=='cli':
+   sys.argv=[payload['module']] + payload['args'].get('argv', [])
+   code=fn()
+   print(logs.getvalue(), end='', file=sys.__stdout__)
+   sys.exit(code)
+  else:
+   args=payload['args']
+   positional=[args.pop(name, payload['defaults'].get(name)) for name in payload['posonly']]
+   result=fn(*positional, **args)
+ encoded=json.dumps({'result':result}, allow_nan=False).encode('utf-8')
+ with os.fdopen(response_fd, 'wb', closefd=True) as response:
+  response.write(len(encoded).to_bytes(4, 'big') + encoded)
+except ModuleNotFoundError as exc:
+ print('Missing runtime module: ' + str(exc.name) + '. Install reviewed declared dependencies manually in the server interpreter.', file=sys.stderr)
+ sys.exit(1)
+'''
+
+def handle(args, **kwargs):
+ try:
+  if not isinstance(args, dict) or set(args) - set(SCHEMA['properties']):
+   raise ValueError('unexpected arguments')
+  if any(k not in args for k in SCHEMA.get('required', [])):
+   raise ValueError('missing required arguments')
+  kinds={'string': str, 'integer': int, 'number': (int, float), 'boolean': bool}
+  for key, value in args.items():
+   spec=SCHEMA['properties'][key]
+   if spec['type']=='array':
+    valid=isinstance(value,list) and all(type(x) is str for x in value)
+   else:
+    valid=isinstance(value,kinds[spec['type']]) and not (isinstance(value,bool) and spec['type'] != 'boolean')
+   if not valid or (isinstance(value, float) and not math.isfinite(value)): raise ValueError('invalid type or non-finite value for ' + key)
+  files={}
+  total=0
+  resource_total=0
+  if len(DIGESTS)>512: raise ValueError('too many package files')
+  for name, expected in DIGESTS.items():
+   path=ROOT.joinpath(*name.split('/'))
+   for part in (path, *path.parents):
+    if part == ROOT.parent: break
+    info=part.lstat()
+    if part.is_symlink() or getattr(info, 'st_file_attributes', 0) & 0x400: raise ValueError('source digest mismatch')
+   resource=not name.endswith('.py')
+   limit=min(262144 if resource else 1048576, 8388608-total, 1048576-resource_total if resource else 8388608)
+   info=path.lstat()
+   if not stat.S_ISREG(info.st_mode) or info.st_size>limit: raise ValueError('source digest mismatch or size limit')
+   fd=os.open(path, os.O_RDONLY | getattr(os,'O_BINARY',0) | getattr(os,'O_NOFOLLOW',0))
+   with os.fdopen(fd,'rb') as stream:
+    actual=os.fstat(stream.fileno())
+    if not stat.S_ISREG(actual.st_mode) or getattr(actual,'st_file_attributes',0) & 0x400 or (info.st_dev,info.st_ino)!=(actual.st_dev,actual.st_ino): raise ValueError('source digest mismatch')
+    data=stream.read(limit+1)
+   if len(data)>limit or hashlib.sha256(data).hexdigest()!=expected: raise ValueError('source digest mismatch or size limit')
+   total+=len(data)
+   if resource: resource_total+=len(data)
+   files[name]=base64.b64encode(data).decode('ascii')
+  payload=json.dumps({'files':files, 'module':MODULE, 'function':FUNCTION, 'kind':KIND, 'args':args, 'posonly':POSONLY, 'defaults':{k:v['default'] for k,v in SCHEMA['properties'].items() if 'default' in v}}, allow_nan=False).encode()
+  safe_env={k:v for k,v in os.environ.items() if k.upper() in {'SYSTEMROOT','WINDIR','COMSPEC','PATH','PATHEXT','TEMP','TMP','TMPDIR','LANG','LC_ALL'}}
+  run = _run_contained([sys.executable,'-I','-c',PROGRAM], payload, cancel=kwargs.get('cancel'), env=safe_env, memory_limit=True, response_pipe=KIND != 'cli')
+  returncode, stdout, stderr = run[:3]
+  stdout_text=stdout.decode('utf-8','replace')
+  stderr_text=stderr.decode('utf-8','replace')
+  if KIND == 'cli':
+   return json.dumps({'success':returncode==0, 'output':stdout_text, 'stdout':stdout_text, 'stderr':stderr_text, 'error':stderr_text if returncode else ''})
+  if returncode:
+   return json.dumps({'success':False,'output':'','stdout':stdout_text,'stderr':stderr_text,'error':stderr_text})
+  frame=run[3]
+  if len(frame)<4 or int.from_bytes(frame[:4], 'big') != len(frame)-4: raise ValueError('invalid worker response frame')
+  response=json.loads(frame[4:])
+  if not isinstance(response, dict) or set(response) != {'result'}: raise ValueError('invalid worker response')
+  return json.dumps({'success':True,'output':json.dumps(response['result'], allow_nan=False), 'stdout':stdout_text, 'stderr':stderr_text, 'error':''}, allow_nan=False)
+ except Exception as exc:
+  return json.dumps({'success':False,'error':str(exc)})

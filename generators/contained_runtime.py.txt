@@ -1,0 +1,218 @@
+# Process containment is lifecycle control, not a security sandbox.
+import os
+import signal
+import subprocess
+import threading
+import time
+import queue
+
+
+class PersistentWorker:
+    """Windows job controls lifetime, not the privileges of reviewed code."""
+    def __init__(self, command):
+        if os.name != 'nt':
+            raise ValueError('Windows job containment required')
+        import ctypes
+        from ctypes import wintypes
+        self.kernel = kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        kernel.SetInformationJobObject.restype = wintypes.BOOL
+        kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [('PerProcessUserTimeLimit', ctypes.c_longlong), ('PerJobUserTimeLimit', ctypes.c_longlong), ('LimitFlags', wintypes.DWORD), ('MinimumWorkingSetSize', ctypes.c_size_t), ('MaximumWorkingSetSize', ctypes.c_size_t), ('ActiveProcessLimit', wintypes.DWORD), ('Affinity', ctypes.c_size_t), ('PriorityClass', wintypes.DWORD), ('SchedulingClass', wintypes.DWORD)]
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(x, ctypes.c_ulonglong) for x in ('ReadOperationCount','WriteOperationCount','OtherOperationCount','ReadTransferCount','WriteTransferCount','OtherTransferCount')]
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [('BasicLimitInformation', BasicLimits), ('IoInfo', IoCounters), ('ProcessMemoryLimit', ctypes.c_size_t), ('JobMemoryLimit', ctypes.c_size_t), ('PeakProcessMemoryUsed', ctypes.c_size_t), ('PeakJobMemoryUsed', ctypes.c_size_t)]
+        self.job = kernel.CreateJobObjectW(None, None)
+        self.process = None
+        if not self.job:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            limits = ExtendedLimits()
+            limits.BasicLimitInformation.LimitFlags = 0x2000 | 0x100 | 0x200
+            limits.ProcessMemoryLimit = 256 * 1024 * 1024
+            limits.JobMemoryLimit = 512 * 1024 * 1024
+            if not kernel.SetInformationJobObject(self.job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=0x4)
+            if not kernel.AssignProcessToJobObject(self.job, int(self.process._handle)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            resume = ctypes.WinDLL('ntdll').NtResumeProcess
+            resume.argtypes = [wintypes.HANDLE]; resume.restype = ctypes.c_long
+            if resume(int(self.process._handle)) != 0:
+                raise OSError('could not resume contained process')
+        except BaseException:
+            self.close()
+            raise
+
+    def request(self, payload, timeout=30, cancel=None):
+        if len(payload) + 1 > 1048576 or b'\n' in payload:
+            raise ValueError('request limit exceeded')
+        result = queue.Queue(maxsize=1)
+        def exchange():
+            try:
+                self.process.stdin.write(payload + b'\n')
+                self.process.stdin.flush()
+                result.put(self.process.stdout.readline(1048577))
+            except Exception:
+                result.put(None)
+        threading.Thread(target=exchange, daemon=True).start()
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancel and cancel.is_set():
+                self.close(); raise ValueError('cancelled')
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.close(); raise ValueError('timeout')
+            try:
+                line = result.get(timeout=min(.05, remaining))
+                break
+            except queue.Empty:
+                continue
+        if not line or len(line) > 1048576 or not line.endswith(b'\n'):
+            self.close(); raise ValueError('invalid or oversized worker response')
+        return line
+
+    def close(self):
+        if self.job:
+            self.kernel.CloseHandle(self.job)
+            self.job = None
+        if self.process:
+            if self.process.poll() is None:
+                self.process.kill()
+            self.process.wait()
+            for pipe in (self.process.stdin, self.process.stdout):
+                if pipe:
+                    pipe.close()
+            self.process = None
+
+
+def _run_contained(command, payload, timeout=30, cancel=None, env=None, memory_limit=False, response_pipe=False):
+    if cancel and cancel.is_set():
+        raise ValueError('cancelled')
+    if memory_limit and os.name != 'nt':
+        raise ValueError('memory limit unavailable on non-Windows platforms')
+    job = None
+    process = None
+    threads = []
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        kernel.SetInformationJobObject.restype = wintypes.BOOL
+        kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [('PerProcessUserTimeLimit', ctypes.c_longlong), ('PerJobUserTimeLimit', ctypes.c_longlong), ('LimitFlags', wintypes.DWORD), ('MinimumWorkingSetSize', ctypes.c_size_t), ('MaximumWorkingSetSize', ctypes.c_size_t), ('ActiveProcessLimit', wintypes.DWORD), ('Affinity', ctypes.c_size_t), ('PriorityClass', wintypes.DWORD), ('SchedulingClass', wintypes.DWORD)]
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(x, ctypes.c_ulonglong) for x in ('ReadOperationCount','WriteOperationCount','OtherOperationCount','ReadTransferCount','WriteTransferCount','OtherTransferCount')]
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [('BasicLimitInformation', BasicLimits), ('IoInfo', IoCounters), ('ProcessMemoryLimit', ctypes.c_size_t), ('JobMemoryLimit', ctypes.c_size_t), ('PeakProcessMemoryUsed', ctypes.c_size_t), ('PeakJobMemoryUsed', ctypes.c_size_t)]
+        job = kernel.CreateJobObjectW(None, None)
+        if not job:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = ExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE; no breakaway
+        if memory_limit:
+            limits.BasicLimitInformation.LimitFlags |= 0x100 | 0x200
+            limits.ProcessMemoryLimit = 256 * 1024 * 1024
+            limits.JobMemoryLimit = 512 * 1024 * 1024
+        if not kernel.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            error = ctypes.get_last_error(); kernel.CloseHandle(job); raise ctypes.WinError(error)
+    read_fd = write_fd = None
+    try:
+        opts = {'creationflags': 0x4} if os.name == 'nt' else {'start_new_session': True}
+        if response_pipe:
+            read_fd, write_fd = os.pipe()
+            os.set_inheritable(write_fd, True)
+            if os.name == 'nt':
+                import msvcrt
+                handle = msvcrt.get_osfhandle(write_fd)
+                startup = subprocess.STARTUPINFO()
+                startup.lpAttributeList = {'handle_list': [handle]}
+                opts['startupinfo'] = startup
+                command = [*command, str(handle)]
+            else:
+                opts['pass_fds'] = (write_fd,)
+                command = [*command, str(write_fd)]
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, **opts)
+        if write_fd is not None:
+            os.close(write_fd); write_fd = None
+        if job:
+            if not kernel.AssignProcessToJobObject(job, int(process._handle)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            # Popen closes the primary thread handle. NtResumeProcess resumes the
+            # suspended process only after successful job assignment; absence or
+            # failure is fatal and leaves the child suspended until termination.
+            ntdll = ctypes.WinDLL('ntdll')
+            resume = ntdll.NtResumeProcess
+            resume.argtypes = [wintypes.HANDLE]; resume.restype = ctypes.c_long
+            status = resume(int(process._handle))
+            if status != 0:
+                raise OSError('could not resume contained process: NTSTATUS %08x' % (status & 0xffffffff))
+        buffers = [bytearray(), bytearray(), bytearray()]
+        overflow = threading.Event()
+        def feed():
+            try:
+                process.stdin.write(payload)
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            finally:
+                process.stdin.close()
+        def drain(pipe, buffer, limit):
+            try:
+                while True:
+                    chunk = pipe.read(8192)
+                    if not chunk: break
+                    remaining = limit - len(buffer)
+                    buffer.extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        overflow.set(); break
+            finally:
+                pipe.close()
+        threads = [threading.Thread(target=feed, daemon=True)] + [threading.Thread(target=drain, args=(pipe, buf, limit), daemon=True) for pipe, buf, limit in ((process.stdout, buffers[0], 1048576), (process.stderr, buffers[1], 4096))]
+        if response_pipe:
+            response_reader = os.fdopen(read_fd, 'rb'); read_fd = None
+            threads.append(threading.Thread(target=drain, args=(response_reader, buffers[2], 1048580), daemon=True))
+        for thread in threads: thread.start()
+        deadline = time.monotonic() + timeout
+        # WNOWAIT keeps the POSIX group leader's PID reserved until killpg.
+        def exited():
+            if os.name == 'nt': return process.poll() is not None
+            return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        while not exited() and not overflow.is_set() and not (cancel and cancel.is_set()) and time.monotonic() < deadline:
+            time.sleep(.01)
+        timed_out = time.monotonic() >= deadline and not exited()
+    finally:
+        if write_fd is not None: os.close(write_fd)
+        if read_fd is not None: os.close(read_fd)
+        if job:
+            kernel.CloseHandle(job)  # kills assigned descendants, even after root exit
+        if process:
+            if os.name == 'nt':
+                if process.poll() is None:
+                    process.kill()  # also handles assignment failure while suspended
+            else:
+                try: os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+            process.wait()
+            for thread in threads:
+                if thread.ident is not None: thread.join(timeout=1)
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                if not pipe.closed and not threads: pipe.close()
+    if cancel and cancel.is_set(): raise ValueError('cancelled')
+    if timed_out or overflow.is_set(): raise ValueError('timeout' if timed_out else 'output limit exceeded')
+    if response_pipe:
+        return process.returncode, buffers[0], buffers[1], buffers[2]
+    return process.returncode, buffers[0], buffers[1]

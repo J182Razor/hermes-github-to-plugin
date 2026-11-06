@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -27,15 +28,31 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
+def _detection_error(exc):
+    if isinstance(exc, detector.InvalidRepoURL):
+        return 'invalid repository URL; expected credential-free GitHub HTTPS owner/repo'
+    if isinstance(exc, detector.WindowsACLSupportError):
+        return 'Windows private ACL support unavailable; install pywin32 in the converter environment'
+    if isinstance(exc, detector.CloneAccessError):
+        return 'repository inaccessible or network clone failed'
+    return 'repository detection failed'
+
+
 def handle_detect_repo(args: Dict[str, Any], **_kw) -> str:
     url = (args.get("repo_url") or "").strip()
     if not url:
         return _json({"success": False, "error": "repo_url required"})
     try:
         rep = detector.detect_repo(url)
-        return _json({"success": True, **rep})
-    except Exception as e:
-        return _json({"success": False, "error": str(e)})
+        cleanup = rep.pop('_cleanup', None)
+        try:
+            rep.pop('repo_path', None)
+            return _json({"success": True, **rep})
+        finally:
+            if cleanup:
+                cleanup()
+    except Exception as exc:
+        return _json({"success": False, "error": _detection_error(exc)})
 
 
 def _resolve_output_dir(output_dir: str) -> str:
@@ -50,127 +67,101 @@ def handle_convert_repo(args: Dict[str, Any], **_kw) -> str:
     if not url:
         return _json({"success": False, "error": "repo_url required"})
     name = (args.get("name") or "").strip()
+    if len(name) > 64:
+        return _json({"success": False, "error": "invalid plugin name: maximum 64 characters"})
+    if name and (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name)
+                 or name.endswith(".")
+                 or re.fullmatch(r"(?i:con|prn|aux|nul|com[1-9]|lpt[1-9])", name.split(".")[0])):
+        return _json({"success": False, "error": "invalid plugin name"})
     forced_type = (args.get("type") or "").strip()
     output_dir = _resolve_output_dir((args.get("output_dir") or "").strip())
 
     try:
-        rep = detector.detect_repo(url)
-    except Exception as e:
-        return _json({"success": False, "error": str(e)})
+        rep = detector.detect_repo(url, retain_clone=True)
+    except Exception as exc:
+        return _json({"success": False, "error": _detection_error(exc)})
 
+    cleanup = rep.pop('_cleanup', None)
+    try:
+        result = _convert_detected(rep, forced_type, name, output_dir)
+    finally:
+        if cleanup:
+            try:
+                cleanup()
+            except Exception:
+                return _json({'success': False, 'error': 'clone cleanup failed; inspect private scratch directory'})
+    return result
+
+
+def _convert_detected(rep, forced_type, name, output_dir):
+    if len(name) > 64:
+        return _json({"success": False, "error": "invalid plugin name: maximum 64 characters"})
     if forced_type:
         rep["type"] = forced_type
+    rep['_explicit_mcp'] = forced_type == 'mcp'
     if not name:
         name = rep.get("suggested_name", "converted-plugin").replace(" ", "-").lower()
         # sanitize
-        import re
         name = re.sub(r"[^a-z0-9-]", "-", name).strip("-") or "converted-plugin"
 
     repo_path = rep["repo_path"]
     ptype = rep["type"]
+    # Do not silently turn an MCP-dependent console server into a CLI adapter.
+    # Explicit CLI remains available when the operator intends that behavior.
+    if not forced_type and ptype == 'cli':
+        try:
+            metadata = detector._metadata_io.toml_data(Path(repo_path) / 'pyproject.toml', detector.METADATA_LIMIT)
+            project = metadata.get('project', {})
+            dependencies = project.get('dependencies', []) if isinstance(project, dict) else []
+            if isinstance(dependencies, list) and any(
+                isinstance(req, str) and re.match(r'(?i)^mcp(?:[ \t]*(?:\[|==|!=|<=|>=|<|>|;|@)|$)', req)
+                for req in dependencies
+            ):
+                return _json({'success': False, 'error': 'MCP dependency with CLI detection is ambiguous; inspect the source and explicitly select type mcp or cli'})
+        except (OSError, ValueError):
+            pass
+    try:
+        detector.reject_link_components(Path(output_dir) / name)
+    except (OSError, ValueError) as e:
+        return _json({'success': False, 'error': 'unsafe or inaccessible output path'})
+    if (Path(output_dir) / name).exists() or (Path(output_dir) / name).is_symlink():
+        return _json({"success": False, "error": "output path already exists"})
 
     try:
-        if ptype == "mcp":
-            try:
-                from generators import mcp as gen
-            except Exception:
-                import sys, os
-                sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-                from generators import mcp as gen
-        elif ptype == "rest":
-            try:
-                from .generators import rest as gen
-            except Exception:
-                from generators import rest as gen
-        elif ptype == "cli":
-            try:
-                from .generators import cli as gen
-            except Exception:
-                from generators import cli as gen
-        elif ptype == "python_pkg":
-            try:
-                from .generators import python_pkg as gen
-            except Exception:
-                from generators import python_pkg as gen
-        elif ptype == "skill_bundle":
-            try:
-                from .generators import skill_bundle as gen
-            except Exception:
-                from generators import skill_bundle as gen
+        if ptype in ("skill_bundle", "rest", "mcp"):
+            filename = ptype + "_safe" if ptype in ("rest", "mcp") else ptype
+            gen = _load_module(f"generator_{ptype}", f"generators/{filename}.py")
+        elif ptype in ("cli", "python_pkg"):
+            gen = _load_module("generator_fixed_adapter", "generators/fixed_adapter.py")
         else:
-            # unknown: create skeleton native plugin
-            out = Path(output_dir) / name
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "plugin.yaml").write_text(
-                f"name: {name}\nversion: 1.0.0\ndescription: \"Skeleton generated (unknown type)\"\nauthor: BlueStarJL\nlicense: MIT\nrequires_hermes: \">=0.22.0\"\nprovides_tools: []\nprovides_hooks: []\nrequires_env: []\n",
-                encoding="utf-8",
-            )
-            (out / "DETECTION_REPORT.md").write_text(json.dumps(rep, indent=2), encoding="utf-8")
-            (out / "README.md").write_text(f"# {name}\n\nManual completion required.\n", encoding="utf-8")
-            gen_result = {"output_path": str(out), "files": []}
-            # skip generator
-            gen = None
-            gen_result = {"output_path": str(out), "files": sorted(str(p.relative_to(out)) for p in out.rglob("*") if p.is_file())}
-        if ptype != "unknown":
-            gen_result = gen.generate(repo_path, output_dir, name, rep)
-    except Exception as e:
-        return _json({"success": False, "error": f"generation failed: {e}", "report": rep})
+            return _json({"success": False, "error": "unsupported or ambiguous source; inspect it and specify type=mcp or type=cli if appropriate", "type": ptype})
+        gen_result = gen.generate(repo_path, output_dir, name, rep)
+    except ValueError as exc:
+        if ptype == 'rest' and str(exc) == 'YAML support requires PyYAML':
+            return _json({"success": False, "error": "YAML OpenAPI conversion requires PyYAML in the converter environment"})
+        if ptype == 'mcp':
+            return _json({"success": False, "error": "MCP source is unsupported or ambiguous; inspect source and specify type=mcp for the supported console subset, or provide a supported mcp.json"})
+        return _json({"success": False, "error": "generation failed; source may be unsupported or output inaccessible"})
+    except Exception:
+        return _json({"success": False, "error": "generation failed; source may be unsupported or output inaccessible"})
 
-    out_path = gen_result["output_path"]
-
-    # validate
-    validation = "fail"
-    report_val = ""
-    try:
-        r = subprocess.run(["hermes", "plugins", "validate", out_path, "--install-deps"], capture_output=True, text=True, timeout=300)
-        report_val = (r.stdout or "") + (r.stderr or "")
-        validation = "pass" if r.returncode == 0 else "fail"
-    except Exception as e:
-        report_val = str(e)
-
-    # doctor
-    doctor_report = ""
-    try:
-        r2 = subprocess.run(["hermes", "plugins", "doctor", out_path, "--ci"], capture_output=True, text=True, timeout=300)
-        doctor_report = (r2.stdout or "") + (r2.stderr or "")
-    except Exception as e:
-        doctor_report = str(e)
-
-    return _json({
-        "success": True,
-        "output_path": out_path,
-        "type": ptype,
-        "validation": validation,
-        "validation_report": report_val,
-        "doctor_report": doctor_report,
-        "files": gen_result.get("files", []),
-    })
+    return _json({"success": True, "output_path": gen_result["output_path"],
+                  "type": ptype, "status": gen_result.get("status", "generated; review required"), "validation": "not run; review required",
+                  "files": gen_result.get("files", [])})
 
 
 def handle_validate_plugin(args: Dict[str, Any], **_kw) -> str:
-    path = (args.get("path") or "").strip()
-    if not path:
-        return _json({"success": False, "error": "path required"})
-    val_report = ""
-    doc_report = ""
-    val_code = 1
-    doc_code = 1
+    path = args.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return _json({"success": False, "static_only": True, "runtime_validation": "not run",
+                      "errors": ["path required"], "checks": [],
+                      "warnings": ["Static checks are not full Hermes validation or a security assessment."]})
     try:
-        r = subprocess.run(["hermes", "plugins", "validate", path, "--install-deps"], capture_output=True, text=True, timeout=300)
-        val_report = (r.stdout or "") + (r.stderr or "")
-        val_code = r.returncode
-    except Exception as e:
-        val_report = str(e)
-    try:
-        r2 = subprocess.run(["hermes", "plugins", "doctor", path, "--ci"], capture_output=True, text=True, timeout=300)
-        doc_report = (r2.stdout or "") + (r2.stderr or "")
-        doc_code = r2.returncode
-    except Exception as e:
-        doc_report = str(e)
-    return _json({
-        "success": val_code == 0 and doc_code == 0,
-        "validate_exit": val_code,
-        "doctor_exit": doc_code,
-        "validation_report": val_report,
-        "doctor_report": doc_report,
-    })
+        validator = _load_module("static_validation", "static_validation.py")
+        report = validator.validate_static(path.strip())
+        report["success"] = report.pop("ok")
+        return _json(report)
+    except Exception:
+        return _json({"success": False, "static_only": True, "runtime_validation": "not run",
+                      "checks": [], "errors": ["static validation could not be completed"],
+                      "warnings": ["Static checks are not full Hermes validation or a security assessment."]})

@@ -1,0 +1,126 @@
+import asyncio
+import base64
+import hashlib
+import json
+import re
+import subprocess
+import sys
+from mcp import ClientSession
+from mcp.client.stdio import stdio_client, StdioServerParameters
+
+BOOTSTRAP = "import os, json, base64, hashlib, sys\nframe = bytearray()\nwhile len(frame) < 1048576:\n    byte = os.read(0, 1)\n    if not byte: raise ValueError('invalid bootstrap frame')\n    if byte == bytes([10]): break\n    frame.extend(byte)\nelse: raise ValueError('bootstrap frame limit exceeded')\ndef unique(pairs):\n    result = {}\n    for key, value in pairs:\n        if key in result: raise ValueError('duplicate JSON key')\n        result[key] = value\n    return result\nmessage = json.loads(frame, object_pairs_hook=unique)\nif not isinstance(message, dict) or set(message) != {'jsonrpc', 'method', 'params'} or message['jsonrpc'] != '2.0' or message['method'] != 'notifications/reviewed-source': raise ValueError('invalid bootstrap frame')\ndata = message['params']\nif not isinstance(data, dict) or set(data) != {'source', 'digest'}: raise ValueError('invalid bootstrap payload')\nb = base64.b64decode(data['source'], validate=True)\nif hashlib.sha256(b).hexdigest() != data['digest']: raise ValueError('digest mismatch')\nsys.argv = ['reviewed_source']\nexec(compile(b, 'reviewed_source', 'exec'), {'__name__':'__main__', '__file__':'reviewed_source'})\n"
+
+PACKAGE_BOOTSTRAP = "import os, json, base64, hashlib, sys\nframe = bytearray()\nwhile len(frame) < 1048576:\n    byte = os.read(0, 1)\n    if not byte: raise ValueError('invalid bootstrap frame')\n    if byte == bytes([10]): break\n    frame.extend(byte)\nelse: raise ValueError('bootstrap frame limit exceeded')\ndef unique(pairs):\n    result = {}\n    for key, value in pairs:\n        if key in result: raise ValueError('duplicate JSON key')\n        result[key] = value\n    return result\nmessage = json.loads(frame, object_pairs_hook=unique)\nif not isinstance(message, dict) or set(message) != {'jsonrpc', 'method', 'params'} or message['jsonrpc'] != '2.0' or message['method'] != 'notifications/reviewed-source': raise ValueError('invalid bootstrap frame')\ndata = message['params']\nif not isinstance(data, dict): raise ValueError('invalid bootstrap payload')\npayload = data.get('package')\nif not isinstance(payload, dict): raise ValueError('invalid package payload')\nconsole = 'entrypoint' in payload\nif set(data) != ({'package', 'digests', 'requirements', 'startup_args', 'startup_digest'} if console else {'package', 'digests'}): raise ValueError('invalid bootstrap payload')\nif set(payload) != ({'module', 'files', 'entrypoint', 'identity'} if console else {'module', 'files'}): raise ValueError('invalid package payload')\nimport re\nidentifier = r'[A-Za-z_][A-Za-z0-9_]*'\nif not isinstance(payload['module'], str) or not re.fullmatch(identifier + r'(?:\\.' + identifier + r')*', payload['module'], re.ASCII): raise ValueError('invalid package module')\nif console and ('.' in payload['module'] or not isinstance(payload['entrypoint'], str) or not re.fullmatch(identifier, payload['entrypoint'], re.ASCII)): raise ValueError('invalid console entrypoint')\nif not isinstance(payload['files'], dict) or not isinstance(data['digests'], dict): raise ValueError('invalid package files')\nimport base64, importlib.abc, importlib.util, json, runpy, sys\npayload = data['package']\nif set(payload['files']) != set(data['digests']): raise ValueError('digest mismatch')\nfiles = {k: base64.b64decode(v, validate=True) for k, v in payload['files'].items()}\nif any(hashlib.sha256(v).hexdigest() != data['digests'][k] for k, v in files.items()): raise ValueError('digest mismatch')\nif console:\n    startup = data['startup_args']\n    if not isinstance(startup, list) or len(startup) > 64 or any(not isinstance(x, str) or len(x) > 4096 or chr(0) in x for x in startup): raise ValueError('invalid startup arguments')\n    encoded = json.dumps(startup, ensure_ascii=True, separators=(',', ':')).encode()\n    if len(encoded) > 98304 or hashlib.sha256(encoded).hexdigest() != data['startup_digest']: raise ValueError('startup arguments digest mismatch')\n    requirements = data['requirements']\n    pattern = r'[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?:[ \\t]*(?:==|!=|<=|>=|<|>)[ \\t]*[0-9]+(?:\\.[0-9]+)*(?:[ \\t]*,[ \\t]*(?:==|!=|<=|>=|<|>)[ \\t]*[0-9]+(?:\\.[0-9]+)*)*)?'\n    if not isinstance(requirements, list) or len(requirements) > 64 or any(not isinstance(x, str) or len(x) > 256 or not re.fullmatch(pattern, x, re.ASCII) for x in requirements): raise ValueError('invalid requirements')\n    import importlib.metadata as metadata\n    for req in requirements:\n        name, specs = re.fullmatch(r'([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)(.*)', req).groups()\n        try: installed = metadata.version(name)\n        except metadata.PackageNotFoundError: raise ValueError('missing required distribution: ' + req) from None\n        if not re.fullmatch(r'[0-9]+(?:\\.[0-9]+)*', installed): raise ValueError('unsupported installed version for ' + req + ': ' + installed)\n        actual = tuple(map(int, installed.split('.')))\n        for op, value in re.findall(r'(==|!=|<=|>=|<|>)\\s*([0-9]+(?:\\.[0-9]+)*)', specs):\n            expected = tuple(map(int, value.split('.')))\n            size = max(len(actual), len(expected))\n            a, b = actual + (0,) * (size-len(actual)), expected + (0,) * (size-len(expected))\n            if not {'==': a == b, '!=': a != b, '<=': a <= b, '>=': a >= b, '<': a < b, '>': a > b}[op]: raise ValueError('dependency version mismatch: ' + req + ' (installed ' + installed + ')')\nif console:\n    identity = payload['identity']\n    if not isinstance(identity, dict) or set(identity) != {'name', 'version'}: raise ValueError('invalid project identity')\n    name, version = identity['name'], identity['version']\n    if not isinstance(name, str) or len(name) > 128 or not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?', name, re.ASCII) or not isinstance(version, str) or len(version) > 64 or not re.fullmatch(r'[0-9]+(?:\\.[0-9]+)*', version, re.ASCII): raise ValueError('invalid project identity')\n    normalize = lambda value: re.sub(r'[-_.]+', '-', value).lower()\n    if any(normalize(re.match(r'[A-Za-z0-9._-]+', req).group()) == normalize(name) for req in requirements): raise ValueError('project identity conflicts with dependency')\n    try: metadata.distribution(name)\n    except metadata.PackageNotFoundError: pass\n    else: raise ValueError('project identity conflicts with installed distribution')\n    from email.message import Message\n    class ReviewedDistribution(metadata.Distribution):\n        @property\n        def metadata(self):\n            result = Message()\n            result['Name'] = name\n            result['Version'] = version\n            return result\n        def read_text(self, filename): return None\n        def locate_file(self, path): raise NotImplementedError('distribution resources unsupported')\n    class ReviewedFinder(metadata.DistributionFinder):\n        def find_distributions(self, context=metadata.DistributionFinder.Context()):\n            if context.name is not None and normalize(context.name) == normalize(name): yield ReviewedDistribution()\n    sys.meta_path.insert(0, ReviewedFinder())\ntop = payload['module'].split('.')[0]\nif top in sys.stdlib_module_names or top in sys.modules:\n    raise ImportError('package name conflicts with runtime module')\nclass Loader(importlib.abc.MetaPathFinder, importlib.abc.Loader):\n    def lookup(self, name):\n        path = name.replace('.', '/')\n        if path + '/__init__.py' in files: return path + '/__init__.py', True\n        if path + '.py' in files: return path + '.py', False\n        return None\n    def find_spec(self, fullname, path=None, target=None):\n        item = self.lookup(fullname)\n        if item: return importlib.util.spec_from_loader(fullname, self, is_package=item[1])\n        if fullname == top or fullname.startswith(top + '.'): raise ImportError('unmapped package module')\n        return None\n    def create_module(self, spec): return None\n    def exec_module(self, module): exec(self.get_code(module.__name__), module.__dict__)\n    def get_code(self, fullname):\n        path, _ = self.lookup(fullname)\n        try: return compile(files[path], '<reviewed:' + path + '>', 'exec', dont_inherit=True)\n        except (SyntaxError, ValueError): raise ValueError('invalid reviewed source') from None\n    def is_package(self, fullname): return self.lookup(fullname)[1]\nsys.meta_path.insert(0, Loader())\nsys.argv = [payload['module']] + (startup if console else [])\nif console:\n    import importlib, ast, inspect, types\n    entry = payload['entrypoint']\n    package_path = top + '/__init__.py'\n    tree = ast.parse(files[package_path], filename='<reviewed:' + package_path + '>')\n    exports = [(n, a) for n in tree.body if isinstance(n, ast.ImportFrom) and n.level == 1 and n.module for a in n.names if (a.asname or a.name) == entry]\n    definitions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == entry]\n    origin, origin_name, origin_path = top, entry, package_path\n    if not definitions and len(exports) == 1:\n        export, alias = exports[0]\n        origin, origin_name = top + '.' + export.module, alias.name\n        origin_path = origin.replace('.', '/') + '.py'\n        tree = ast.parse(files[origin_path], filename='<reviewed:' + origin_path + '>')\n        definitions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == origin_name]\n    if len(definitions) != 1 or definitions[0].decorator_list: raise ValueError('entrypoint binding mismatch')\n    code = compile(files[origin_path], '<reviewed:' + origin_path + '>', 'exec', dont_inherit=True)\n    expected = [c for c in code.co_consts if isinstance(c, types.CodeType) and c.co_name == origin_name and c.co_firstlineno == definitions[0].lineno]\n    if len(expected) != 1: raise ValueError('entrypoint binding mismatch')\n    target = getattr(importlib.import_module(top), entry, None)\n    if not inspect.isfunction(target) or target.__module__ != origin or target.__name__ != origin_name or target.__qualname__ != origin_name or target.__code__ != expected[0]: raise ValueError('entrypoint binding mismatch')\n    target()\nelse:\n    runpy.run_module(payload['module'], run_name='__main__', alter_sys=True)\n"
+
+def sdk_major(installed):
+    if not isinstance(installed, str) or not re.fullmatch(r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)', installed, re.ASCII):
+        raise RuntimeError('unsupported MCP version')
+    major = installed.split('.')[0]
+    if major not in ('1', '2'):
+        raise RuntimeError('unsupported MCP version')
+    return major
+
+def tool_result(result, major):
+    if major not in ('1', '2'):
+        raise RuntimeError('unsupported MCP version')
+    flag = getattr(result, 'isError' if major == '1' else 'is_error', None)
+    alternate = 'is_error' if major == '1' else 'isError'
+    if hasattr(result, alternate) and getattr(result, alternate) is not flag:
+        raise RuntimeError('unsupported MCP tool result shape')
+    serialized = result.model_dump(mode='json', by_alias=True, exclude_none=True)
+    if type(flag) is not bool or not isinstance(serialized, dict) or serialized.get('isError') is not flag:
+        raise RuntimeError('unsupported MCP tool result shape')
+    if 'is_error' in serialized and serialized['is_error'] is not flag:
+        raise RuntimeError('unsupported MCP tool result shape')
+    return {'success': not flag, 'result': serialized}
+
+def unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result: raise ValueError('duplicate JSON key')
+        result[key] = value
+    return result
+
+async def main():
+    def read_request():
+        line = sys.stdin.buffer.readline(1048577)
+        if not line:
+            return None
+        if len(line) > 1048576 or not line.endswith(b'\n'):
+            raise ValueError('request limit exceeded')
+        return json.loads(line, object_pairs_hook=unique_pairs)
+    request = await asyncio.to_thread(read_request)
+    if 'package' in request:
+        package = request['package']
+        if not isinstance(package, dict): raise ValueError('invalid package payload')
+        expected = {'package', 'digests', 'name', 'arguments'}
+        if 'entrypoint' in package:
+            expected.update({'requirements', 'startup_args', 'startup_digest'})
+        required = {'package', 'digests'} | ({'requirements', 'startup_args', 'startup_digest'} if 'entrypoint' in package else set())
+        if not required <= set(request) or set(request) - expected: raise ValueError('invalid package request')
+        if set(package['files']) != set(request['digests']):
+            raise ValueError('digest mismatch')
+        for path, encoded in package['files'].items():
+            if hashlib.sha256(base64.b64decode(encoded, validate=True)).hexdigest() != request['digests'][path]:
+                raise ValueError('digest mismatch')
+        if package_envelope_size(package, request.get('requirements')) > 65536:
+            raise ValueError('package envelope cap exceeded')
+        payload = {'package': package, 'digests': request['digests']}
+        if 'requirements' in request:
+            payload['requirements'] = request['requirements']
+            startup = request['startup_args']
+            if not isinstance(startup, list) or len(startup) > 64 or any(not isinstance(x, str) or len(x) > 4096 or '\x00' in x or any(0xD800 <= ord(ch) <= 0xDFFF for ch in x) for x in startup):
+                raise ValueError('invalid startup arguments')
+            encoded = json.dumps(startup, ensure_ascii=True, separators=(',', ':')).encode()
+            if len(encoded) > 98304 or hashlib.sha256(encoded).hexdigest() != request['startup_digest']:
+                raise ValueError('startup arguments digest mismatch')
+            payload['startup_args'] = startup
+            payload['startup_digest'] = request['startup_digest']
+        args = ['-I','-c',PACKAGE_BOOTSTRAP]
+        # CreateProcessW permits 32767 UTF-16 code units, including the NUL.
+        command_line = subprocess.list2cmdline([sys.executable, *args])
+        if len(command_line.encode('utf-16-le', errors='surrogatepass')) // 2 + 1 > 32767:
+            raise ValueError('Windows command-line limit exceeded')
+        params = StdioServerParameters(command=sys.executable, args=args)
+    else:
+        source = base64.b64decode(request['source'], validate=True)
+        if hashlib.sha256(source).hexdigest() != request['digest']:
+            raise ValueError('digest mismatch')
+        payload = {'source': request['source'], 'digest': request['digest']}
+        args = ['-I','-c',BOOTSTRAP]
+        command_line = subprocess.list2cmdline([sys.executable, *args])
+        if len(command_line.encode('utf-16-le', errors='surrogatepass')) // 2 + 1 > 32767:
+            raise ValueError('Windows command-line limit exceeded')
+        params = StdioServerParameters(command=sys.executable, args=args)
+    # Bound the exact SDK JSON serialization (including its trailing newline).
+    from mcp.shared.message import SessionMessage
+    from mcp.types import JSONRPCNotification, JSONRPCMessage
+    from importlib.metadata import version
+    notification = JSONRPCNotification(jsonrpc='2.0', method='notifications/reviewed-source', params=payload)
+    major = sdk_major(version('mcp'))
+    if major == '1' and hasattr(JSONRPCMessage, 'model_fields'):
+        message = JSONRPCMessage(root=notification)
+        frame = message.model_dump_json(by_alias=True, exclude_none=True)
+    elif major == '2' and not hasattr(JSONRPCMessage, 'model_fields'):
+        message = notification
+        frame = message.model_dump_json(by_alias=True, exclude_unset=True)
+    else:
+        raise RuntimeError('unsupported MCP transport API')
+    if len(frame.encode('utf-8')) + 1 > 1048576:
+        raise ValueError('bootstrap frame limit exceeded')
+    transport = stdio_client(params, errlog=sys.stderr)
+    async with transport as (read, write):
+        await write.send(SessionMessage(message))
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            while request is not None:
+                result = await session.call_tool(request['name'], request['arguments'])
+                response = json.dumps(tool_result(result, major))
+                if len(response.encode('utf-8')) + 1 > 1048576:
+                    raise ValueError('response limit exceeded')
+                sys.stdout.buffer.write(response.encode('utf-8') + b'\n')
+                sys.stdout.buffer.flush()
+                request = await asyncio.to_thread(read_request)
+
+if __name__ == '__main__':
+    asyncio.run(main())

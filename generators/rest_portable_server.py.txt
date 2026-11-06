@@ -1,0 +1,180 @@
+import asyncio, ipaddress, json, math, os, sys, threading
+from urllib.parse import urlsplit, quote, urlencode, unquote
+from urllib.request import Request, build_opener, HTTPRedirectHandler, ProxyHandler
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp import types
+
+try:
+    from pathlib import Path
+    config_path = Path(os.environ['PLUGIN_DATA']) / 'openapi-authorization.json'
+    with config_path.open('rb') as f:
+        raw_config = f.read(16385)
+    if len(raw_config) > 16384: raise ValueError()
+    config = json.loads(raw_config)
+    if not isinstance(config, dict) or set(config) != {'base_url', 'operations'}: raise ValueError()
+    BASE = config['base_url'] if isinstance(config['base_url'], str) else ''
+    approved = config['operations']
+    APPROVED = frozenset(approved) if isinstance(approved, list) and all(isinstance(x, str) for x in approved) else frozenset()
+except (ValueError, TypeError, OSError, KeyError):
+    BASE = ''
+    APPROVED = frozenset()
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs): return None
+
+def valid(value, typ):
+    return ((typ == 'string' and isinstance(value, str) and len(value.encode('utf-8')) <= 4096 and not any(ord(c) < 32 or ord(c) == 127 for c in value)) or
+            (typ == 'integer' and type(value) is int) or
+            (typ == 'number' and type(value) in (int, float) and math.isfinite(value)) or
+            (typ == 'boolean' and type(value) is bool))
+
+def valid_json(value, depth=0):
+    # Arbitrary extras may contain JSON objects/arrays, but never Python-only
+    # values, non-string keys or non-finite numbers. Bound nesting separately
+    # from the serialized payload limit.
+    if depth > 64: return False
+    if value is None or type(value) in (str, bool, int): return True
+    if type(value) is float: return math.isfinite(value)
+    if type(value) is list: return all(valid_json(v, depth + 1) for v in value)
+    if type(value) is dict: return all(type(k) is str and valid_json(v, depth + 1) for k, v in value.items())
+    return False
+
+def invoke(op, args, supplied_credential=None):
+    name, path, params, method, body, auth = op
+    try:
+        if method + ' ' + SERVER_PATH + path not in APPROVED: raise ValueError()
+        if not isinstance(args, dict) or set(args) - ({p['name'] for p in params} | ({'body'} if body is not None else set())): raise ValueError()
+        if not BASE or len(BASE) > 2048 or any(ord(c) <= 32 or ord(c) == 127 for c in BASE): raise ValueError()
+        base = urlsplit(BASE)
+        if base.scheme not in ('http', 'https') or not base.hostname or '@' in base.netloc or base.query or base.fragment or base.path not in ('', '/') or '%' in BASE or '\\' in BASE: raise ValueError()
+        base.port
+        target, query, headers = SERVER_PATH + path, [], {}
+        credential = os.environ.get('G2H_API_CREDENTIAL', '') if supplied_credential is None else supplied_credential
+        def contains_secret(value):
+            if isinstance(value, str): return credential in value
+            if isinstance(value, list): return any(contains_secret(v) for v in value)
+            if isinstance(value, dict): return any(contains_secret(k) or contains_secret(v) for k, v in value.items())
+            return False
+        if credential and (contains_secret(args) or credential in BASE): raise ValueError()
+        if auth:
+            if base.scheme != 'https':
+                try: address = ipaddress.ip_address(base.hostname)
+                except ValueError: raise ValueError() from None
+                if not ((address.version == 4 and address in ipaddress.ip_network('127.0.0.0/8')) or
+                        (address.version == 6 and address == ipaddress.ip_address('::1'))): raise ValueError()
+            if not credential or len(credential) > 4096 or '${' in credential or any(ord(c) < 33 or ord(c) > 126 for c in credential): raise ValueError()
+            headers[auth[1]] = ('Bearer ' if auth[0] == 'bearer' else '') + credential
+        for p in params:
+            key = p['name']
+            if key not in args:
+                if p.get('required'): raise ValueError()
+                continue
+            value = args[key]
+            if not valid(value, p['schema']['type']): raise ValueError()
+            value = str(value).lower() if type(value) is bool else str(value)
+            if p['in'] == 'path':
+                if value in ('.', '..') or any(c not in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~' for c in value): raise ValueError()
+                target = target.replace('{' + key + '}', quote(value, safe=''))
+            elif p['in'] == 'query': query.append((key, value))
+            else: headers[key] = value
+        # Check the fully substituted path, not just individual parameters.
+        # A decoded separator or another percent escape can change routing at
+        # an intermediary, so reject those rather than guessing its behavior.
+        decoded = unquote(target, errors='strict')
+        if ('%' in decoded or '\\' in decoded or decoded.count('/') != target.count('/')
+                or any(part in ('.', '..') for part in decoded.split('/'))): raise ValueError()
+        payload = None
+        if body is not None and 'body' not in args and body.get('x-g2h-required', True): raise ValueError()
+        if body is not None and 'body' in args:
+            obj = args['body']
+            if type(obj) is not dict or not valid_json(obj) or not set(body.get('required', [])).issubset(obj): raise ValueError()
+            if not body.get('additionalProperties', True) and set(obj) - set(body['properties']): raise ValueError()
+            if any(not valid(obj[key], spec['type']) for key, spec in body['properties'].items() if key in obj): raise ValueError()
+            payload = json.dumps(obj, allow_nan=False, ensure_ascii=True).encode('utf-8')
+            if len(payload) > 65536: raise ValueError()
+            headers['Content-Type'] = 'application/json'
+        if query: target += '?' + urlencode(query)
+        if len(target) > 8192 or len(headers) > 32: raise ValueError()
+        req = Request(BASE.rstrip('/') + target, data=payload, headers=headers, method=method)
+        with build_opener(ProxyHandler({}), NoRedirect).open(req, timeout=10) as response:
+            raw = response.read(1048577)
+            if len(raw) > 1048576: raise ValueError()
+            if credential and credential.encode('ascii') in raw: raise ValueError()
+            text = raw.decode('utf-8')
+            try: data = json.loads(text)
+            except ValueError: data = text
+            if credential and contains_secret(data): raise ValueError()
+            return {'success': True, 'status':response.status, 'data':data}
+    except Exception:
+        return {'success':False, 'error':'request rejected or failed'}
+
+def input_schema(op):
+    _, _, params, _, body, _ = op
+    props = {p['name']:p['schema'] for p in params}
+    required = [p['name'] for p in params if p.get('required')]
+    if body is not None:
+        props['body'] = {k:v for k,v in body.items() if k != 'x-g2h-required'}
+        if body.get('x-g2h-required', True): required.append('body')
+    return {'type':'object','properties':props,'required':required,'additionalProperties':False}
+
+async def list_tools(ctx, params):
+    return types.ListToolsResult(tools=[types.Tool(name=op[0], description=op[3] + ' ' + SERVER_PATH + op[1] + ' (may modify remote state)', inputSchema=input_schema(op), annotations=types.ToolAnnotations(readOnlyHint=False)) for op in OPERATIONS])
+
+# No waiting queue: admission happens before scheduling a worker thread.
+# The slot is held until cancellation has reaped the contained process.
+WORKER_LIMIT = 4
+_worker_slots = threading.BoundedSemaphore(WORKER_LIMIT)
+
+async def call_tool(ctx, params):
+    op = next((x for x in OPERATIONS if x[0] == params.name), None)
+    result = {'success':False, 'error':'unknown operation'}
+    if op and not _worker_slots.acquire(blocking=False):
+        result = {'success':False, 'error':'server overloaded'}
+    elif op:
+        try:
+            result = await _call_worker(op, params)
+        finally:
+            _worker_slots.release()
+    return types.CallToolResult(content=[types.TextContent(type='text', text=json.dumps(result))], isError=not result['success'])
+
+async def _call_worker(op, params):
+        cancel = threading.Event()
+        payload = json.dumps({'name':op[0], 'args':params.arguments or {}, 'credential':os.environ.get('G2H_API_CREDENTIAL', '')}).encode('utf-8')
+        def run():
+            try:
+                code, stdout, _ = _run_contained([sys.executable, __file__, '--request-worker'], payload, timeout=REQUEST_DEADLINE, cancel=cancel)
+                result = json.loads(stdout) if code == 0 else None
+                if not isinstance(result, dict) or type(result.get('success')) is not bool: raise ValueError()
+                return result
+            except Exception:
+                return {'success':False, 'error':'request rejected or failed'}
+        task = asyncio.create_task(asyncio.to_thread(run))
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancel.set()
+            while not task.done():
+                try: await asyncio.shield(task)
+                except asyncio.CancelledError: continue
+            raise
+        return result
+
+async def main():
+    server = Server('openapi-reviewed', on_list_tools=list_tools, on_call_tool=call_tool)
+    async with stdio_server() as (read, write):
+        await server.run(read, write, server.create_initialization_options())
+
+REQUEST_DEADLINE = 10
+
+if __name__ == '__main__':
+    if sys.argv[1:] == ['--request-worker']:
+        try:
+            request = json.load(sys.stdin)
+            op = next(x for x in OPERATIONS if x[0] == request['name'])
+            result = invoke(op, request['args'], request['credential'])
+            sys.stdout.write(json.dumps(result))
+        except Exception:
+            sys.stdout.write('{"success":false,"error":"request rejected or failed"}')
+    else:
+        asyncio.run(main())
