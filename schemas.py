@@ -37,7 +37,8 @@ CONVERT_REPO_SCHEMA = _schema(
 
 VALIDATE_PLUGIN_SCHEMA = _schema(
     "validate_plugin",
-    "Run limited non-executing static metadata checks only. Success is not full Hermes validation or a security assessment; runtime validation is not run. Full Hermes validate/doctor may execute source and prepare dependencies and requires operator review and authorization.",
-    {"path": _str("Path to the plugin directory.")},
+    "Static metadata checks by default. Runtime mode executes plugin code with your OS privileges, without a sandbox; standard Hermes approval policy may bypass prompts.",
+    {"path": _str("Path to the plugin directory."),
+     "mode": {"type": "string", "enum": ["static", "runtime"], "description": "Runtime invokes the normal Hermes approval gate; it may not prompt."}},
     required=["path"],
 )

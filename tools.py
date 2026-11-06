@@ -151,11 +151,20 @@ def _convert_detected(rep, forced_type, name, output_dir):
 
 
 def handle_validate_plugin(args: Dict[str, Any], **_kw) -> str:
+    mode = args.get("mode", "static")
+    if mode not in ("static", "runtime"):
+        return _json({"success": False, "error": "invalid validation mode"})
     path = args.get("path")
     if not isinstance(path, str) or not path.strip():
         return _json({"success": False, "static_only": True, "runtime_validation": "not run",
                       "errors": ["path required"], "checks": [],
                       "warnings": ["Static checks are not full Hermes validation or a security assessment."]})
+    if mode == "runtime":
+        try:
+            runtime = _load_module("runtime_validation", "runtime_validation.py")
+            return _json(runtime.validate_runtime(path.strip(), detector))
+        except Exception:
+            return _json({"success": False, "runtime_validation": "not run", "error": "runtime validation unavailable"})
     try:
         validator = _load_module("static_validation", "static_validation.py")
         report = validator.validate_static(path.strip())
